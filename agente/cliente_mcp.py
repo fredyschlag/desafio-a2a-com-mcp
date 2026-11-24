@@ -20,6 +20,7 @@ e so uma `str` guardada e devolvida.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import secrets
@@ -34,6 +35,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from mcp_types import (
+    CONNECTION_CLOSED,
     CallToolResult,
     ClientCapabilities,
     DiscoverResult,
@@ -187,59 +189,100 @@ async def _log_headers(request: httpx2.Request) -> None:
 
 
 class ClienteMCP:
-    """Cliente MCP de vida longa. Use como `async with ClienteMCP() as mcp: ...`."""
+    """Cliente MCP de vida longa. Use como `async with ClienteMCP() as mcp: ...`.
+
+    A conexao (httpx + transporte Streamable HTTP + ClientSession) vive numa
+    task propria, a "dona". No SDK 2.3.0 uma falha de rede dentro do
+    transporte estoura o task group dele; isolada na task dona, essa falha
+    derruba so a conexao (o request em voo recebe "Connection closed") e o
+    proximo request reconecta, em vez de derrubar quem criou o cliente.
+    Reconectar nao cria estado de protocolo: cada request ja leva tudo no _meta.
+    """
 
     def __init__(self, url: str | None = None) -> None:
         self.url = url or os.environ.get("MCP_URL", MCP_URL_PADRAO)
-        self._pilha: AsyncExitStack | None = None
         self._sessao: ClientSession | None = None
+        self._dona: asyncio.Task[None] | None = None
+        self._parar: asyncio.Event | None = None
+        self._trava = asyncio.Lock()
         self._tools: dict[str, Tool] | None = None
 
     async def __aenter__(self) -> ClienteMCP:
-        pilha = AsyncExitStack()
-        try:
-            hooks = {"request": [_log_headers]} if os.environ.get("MCP_DEBUG_HEADERS") == "1" else {}
-            http = await pilha.enter_async_context(
-                httpx2.AsyncClient(timeout=httpx2.Timeout(30.0, read=60.0), event_hooks=hooks)
-            )
-            leitura, escrita = await pilha.enter_async_context(streamable_http_client(self.url, http_client=http))
-            sessao = await pilha.enter_async_context(
-                _SessaoSoForm(
-                    dispatcher=JSONRPCDispatcher(leitura, escrita),
-                    client_info=CLIENT_INFO,
-                    elicitation_callback=_elicitation_proibida,
-                )
-            )
-            # Revisao fixada, sem handshake nem server/discover: e o que `Client(mode="2026-07-28")`
-            # faz. Daqui em diante o SDK carimba _meta e headers em todo request.
-            sessao.adopt(
-                DiscoverResult(
-                    supported_versions=[PROTOCOLO],
-                    capabilities=ServerCapabilities(),
-                    result_type="complete",
-                    ttl_ms=0,
-                    cache_scope="private",
-                )
-            )
-            anunciado = sessao._build_capabilities(PROTOCOLO).model_dump(by_alias=True, mode="json", exclude_none=True)
-            if anunciado != CAPABILITIES:
-                raise RuntimeError(f"capabilities anunciadas {anunciado} diferem de {CAPABILITIES}")
-        except BaseException:
-            await pilha.aclose()
-            raise
-        self._pilha, self._sessao = pilha, sessao
+        await self._sessao_viva()
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        if self._pilha is not None:
-            await self._pilha.aclose()
-        self._pilha = self._sessao = None
+        dona, parar = self._dona, self._parar
+        if parar is not None:
+            parar.set()
+        if dona is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(dona), timeout=5)
+            except (asyncio.TimeoutError, Exception):
+                dona.cancel()
+        self._dona = self._parar = self._sessao = None
 
-    @property
-    def _s(self) -> ClientSession:
-        if self._sessao is None:
-            raise RuntimeError("use ClienteMCP dentro de 'async with'")
-        return self._sessao
+    async def _sessao_viva(self) -> ClientSession:
+        async with self._trava:
+            if self._sessao is None or self._dona is None or self._dona.done():
+                pronta: asyncio.Future[ClientSession] = asyncio.get_running_loop().create_future()
+                self._parar = asyncio.Event()
+                self._dona = asyncio.create_task(self._manter_conexao(pronta, self._parar))
+                self._sessao = await pronta
+            return self._sessao
+
+    async def _manter_conexao(self, pronta: asyncio.Future[ClientSession], parar: asyncio.Event) -> None:
+        try:
+            async with AsyncExitStack() as pilha:
+                hooks = {"request": [_log_headers]} if os.environ.get("MCP_DEBUG_HEADERS") == "1" else {}
+                http = await pilha.enter_async_context(
+                    httpx2.AsyncClient(timeout=httpx2.Timeout(30.0, read=60.0), event_hooks=hooks)
+                )
+                leitura, escrita = await pilha.enter_async_context(streamable_http_client(self.url, http_client=http))
+                sessao = await pilha.enter_async_context(
+                    _SessaoSoForm(
+                        dispatcher=JSONRPCDispatcher(leitura, escrita),
+                        client_info=CLIENT_INFO,
+                        elicitation_callback=_elicitation_proibida,
+                    )
+                )
+                # Revisao fixada, sem handshake nem server/discover: e o que `Client(mode="2026-07-28")`
+                # faz. Daqui em diante o SDK carimba _meta e headers em todo request.
+                sessao.adopt(
+                    DiscoverResult(
+                        supported_versions=[PROTOCOLO],
+                        capabilities=ServerCapabilities(),
+                        result_type="complete",
+                        ttl_ms=0,
+                        cache_scope="private",
+                    )
+                )
+                anunciado = sessao._build_capabilities(PROTOCOLO).model_dump(
+                    by_alias=True, mode="json", exclude_none=True
+                )
+                if anunciado != CAPABILITIES:
+                    raise RuntimeError(f"capabilities anunciadas {anunciado} diferem de {CAPABILITIES}")
+                pronta.set_result(sessao)
+                await parar.wait()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:  # falha do transporte: so esta conexao morre
+            print(f"mcp-client conexao encerrada: {type(e).__name__}", file=sys.stderr, flush=True)
+            if not pronta.done():
+                pronta.set_exception(ConnectionError(f"nao foi possivel abrir a conexao MCP: {type(e).__name__}"))
+        finally:
+            if not pronta.done():
+                pronta.set_exception(ConnectionError("conexao MCP encerrada"))
+
+    async def _enviar(self, chamada: Any) -> Any:
+        """Executa `chamada(sessao)`; queda de conexao vira ConnectionError."""
+        sessao = await self._sessao_viva()
+        try:
+            return await chamada(sessao)
+        except MCPError as e:
+            if e.error.code == CONNECTION_CLOSED:
+                raise ConnectionError("servidor MCP indisponivel (conexao encerrada)") from None
+            raise
 
     # -- descoberta e politica ---------------------------------------------
 
@@ -252,7 +295,8 @@ class ClienteMCP:
             params: dict[str, Any] = {"_meta": trace.meta()}
             if cursor:
                 params["cursor"] = cursor
-            resultado = await self._s.list_tools(params=PaginatedRequestParams.model_validate(params))
+            pagina = PaginatedRequestParams.model_validate(params)
+            resultado = await self._enviar(lambda s, p=pagina: s.list_tools(params=p))
             tools.update({t.name: t for t in resultado.tools})
             cursor = resultado.next_cursor
             if not cursor:
@@ -262,7 +306,8 @@ class ClienteMCP:
 
     async def versao_da_politica(self, traceparent: str | None = None) -> str:
         """`resources/read` de politica://uso e a versao declarada na primeira linha."""
-        resultado = await self._s.read_resource(URI_POLITICA, meta=_Trace(traceparent).meta())
+        meta = _Trace(traceparent).meta()
+        resultado = await self._enviar(lambda s: s.read_resource(URI_POLITICA, meta=meta))
         texto = next((c.text for c in resultado.contents if isinstance(c, TextResourceContents)), "")
         primeira = texto.splitlines()[0] if texto else ""
         m = re.match(r"\s*versao:\s*(\S+)", primeira)
@@ -292,7 +337,10 @@ class ClienteMCP:
         """`tools/call` generico, devolvendo o `input_required` cru como `Pausa`."""
         trace = _Trace(traceparent)
         await self._tool(nome, argumentos, trace)
-        resultado = await self._s.call_tool(nome, argumentos, meta=trace.meta(), allow_input_required=True)
+        meta = trace.meta()
+        resultado = await self._enviar(
+            lambda s: s.call_tool(nome, argumentos, meta=meta, allow_input_required=True)
+        )
         return self._interpretar(resultado)
 
     async def reservar(self, argumentos: dict[str, Any], traceparent: str | None = None) -> Concluido | Pausa:
@@ -317,13 +365,16 @@ class ClienteMCP:
         trace = _Trace(traceparent)
         await self._tool(nome, argumentos, trace)
         elicit = resposta if isinstance(resposta, ElicitResult) else ElicitResult.model_validate(resposta)
-        resultado = await self._s.call_tool(
-            nome,
-            argumentos,
-            meta=trace.meta(),
-            input_responses={chave: elicit},
-            request_state=request_state,
-            allow_input_required=True,
+        meta = trace.meta()
+        resultado = await self._enviar(
+            lambda s: s.call_tool(
+                nome,
+                argumentos,
+                meta=meta,
+                input_responses={chave: elicit},
+                request_state=request_state,
+                allow_input_required=True,
+            )
         )
         return self._interpretar(resultado)
 
