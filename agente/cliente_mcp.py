@@ -11,8 +11,9 @@ Este modulo traduz protocolo e nada mais:
 - le o resource `politica://uso` e extrai a versao da primeira linha;
 - devolve o `input_required` cru como uma `Pausa` (chave, alternativas e o
   `requestState` opaco), sem responder a elicitation sozinho;
-- `retomar` repete o `tools/call` com id de JSON-RPC novo (o dispatcher do SDK
-  numera cada request), `inputResponses` e o `requestState` ecoado intacto.
+- `retomar` repete o `tools/call` com id de JSON-RPC novo (unico durante toda a
+  vida do processo, mesmo entre reconexoes), `inputResponses` e o
+  `requestState` ecoado intacto.
 
 O `requestState` nunca e aberto, decodificado, interpretado nem reconstruido:
 e so uma `str` guardada e devolvida.
@@ -21,6 +22,7 @@ e so uma `str` guardada e devolvida.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 import re
 import secrets
@@ -154,6 +156,36 @@ class _SessaoSoForm(ClientSession):
 
 
 # ---------------------------------------------------------------------------
+# ids de JSON-RPC unicos no processo
+# ---------------------------------------------------------------------------
+
+_ids_do_processo = itertools.count(1)
+
+
+class _DispatcherIdsDoProcesso(JSONRPCDispatcher):
+    """`JSONRPCDispatcher` cujos ids vem de um contador do processo inteiro.
+
+    No SDK 2.3.0 cada `JSONRPCDispatcher` numera os requests a partir de 1
+    (mcp/shared/jsonrpc_dispatcher.py):
+
+        def _allocate_id(self) -> int:
+            self._next_id += 1
+            return self._next_id
+
+    e o `ClienteMCP` cria um dispatcher novo a cada reconexao. Sem este ajuste,
+    depois de uma queda do servidor MCP os ids recomecam em 1, e o retry de uma
+    Task pausada antes da queda pode sair com o mesmo id do `tools/call` que
+    pausou (ou de qualquer outro request ja enviado). O MRTR exige id novo no
+    retry, e `call_tool` nao aceita `request_id` para o chamador escolher.
+    Trocar so a alocacao mantem o resto (correlacao de respostas, ids
+    fornecidos pelo chamador, progress token) inteiro no SDK.
+    """
+
+    def _allocate_id(self) -> int:
+        return next(_ids_do_processo)
+
+
+# ---------------------------------------------------------------------------
 # traceparent
 # ---------------------------------------------------------------------------
 
@@ -196,7 +228,8 @@ class ClienteMCP:
     transporte estoura o task group dele; isolada na task dona, essa falha
     derruba so a conexao (o request em voo recebe "Connection closed") e o
     proximo request reconecta, em vez de derrubar quem criou o cliente.
-    Reconectar nao cria estado de protocolo: cada request ja leva tudo no _meta.
+    Reconectar nao cria estado de protocolo: cada request ja leva tudo no _meta,
+    e os ids de JSON-RPC continuam de onde pararam (`_DispatcherIdsDoProcesso`).
     """
 
     def __init__(self, url: str | None = None) -> None:
@@ -206,6 +239,7 @@ class ClienteMCP:
         self._parar: asyncio.Event | None = None
         self._trava = asyncio.Lock()
         self._tools: dict[str, Tool] | None = None
+        self._catalogo_de: ClientSession | None = None  # sessao em que o catalogo foi lido
 
     async def __aenter__(self) -> ClienteMCP:
         await self._sessao_viva()
@@ -241,7 +275,7 @@ class ClienteMCP:
                 leitura, escrita = await pilha.enter_async_context(streamable_http_client(self.url, http_client=http))
                 sessao = await pilha.enter_async_context(
                     _SessaoSoForm(
-                        dispatcher=JSONRPCDispatcher(leitura, escrita),
+                        dispatcher=_DispatcherIdsDoProcesso(leitura, escrita),
                         client_info=CLIENT_INFO,
                         elicitation_callback=_elicitation_proibida,
                     )
@@ -302,6 +336,7 @@ class ClienteMCP:
             if not cursor:
                 break
         self._tools = tools
+        self._catalogo_de = self._sessao
         return tools
 
     async def versao_da_politica(self, traceparent: str | None = None) -> str:
@@ -316,7 +351,15 @@ class ClienteMCP:
         return m.group(1)
 
     async def _tool(self, nome: str, argumentos: dict[str, Any], trace: _Trace) -> Tool:
-        if self._tools is None or nome not in self._tools:
+        # Depois de uma reconexao a ClientSession e nova e nao conhece os
+        # outputSchema das tools; o SDK entao faria por conta propria um
+        # `tools/list` sem _meta (sem traceparent) logo apos o `tools/call`
+        # (mcp/client/session.py: `if name not in self._tool_output_schemas:
+        # await self.list_tools()`). Redescobrir aqui, na sessao nova e com o
+        # trace-id da operacao, mantem a ordem tools/list -> tools/call e o
+        # rastro, e pega qualquer mudanca de catalogo do servidor reiniciado.
+        sessao = await self._sessao_viva()
+        if self._tools is None or self._catalogo_de is not sessao or nome not in self._tools:
             await self.descobrir(f"00-{trace.trace_id}-{secrets.token_hex(8)}-{trace.flags}")
         assert self._tools is not None
         tool = self._tools.get(nome)
