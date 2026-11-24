@@ -362,13 +362,26 @@ def _campo(valor: Any) -> str:
     return texto if _TOKEN_SIMPLES.match(texto) else json.dumps(texto)
 
 
-def _resumo(mensagem: Any) -> tuple[Any, Any, Any, Any]:
+def _json_compacto(valor: Any) -> str:
+    """JSON compacto e ASCII (quebras de linha escapadas): uma linha so, facil de grep."""
+    if valor is None:
+        return "-"
+    return json.dumps(valor, separators=(",", ":"), ensure_ascii=True)
+
+
+def _resumo(mensagem: Any) -> dict[str, Any]:
     if not isinstance(mensagem, dict):
-        return None, None, None, None
+        return {}
     params = mensagem.get("params") if isinstance(mensagem.get("params"), dict) else {}
     meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-    nome = params.get("name") or params.get("uri")
-    return mensagem.get("method"), mensagem.get("id"), nome, meta.get("traceparent")
+    return {
+        "method": mensagem.get("method"),
+        "id": mensagem.get("id"),
+        "name": params.get("name") or params.get("uri"),
+        "traceparent": meta.get("traceparent"),
+        "pv": meta.get("io.modelcontextprotocol/protocolVersion"),
+        "caps": meta.get("io.modelcontextprotocol/clientCapabilities"),
+    }
 
 
 class LogDeRequests:
@@ -422,10 +435,12 @@ class LogDeRequests:
                 bruto = None
             itens = bruto if isinstance(bruto, list) else [bruto]
             for item in itens:
-                metodo, rid, nome, traceparent = _resumo(item)
+                r = _resumo(item)
                 print(
-                    f"mcp-request http_method={scope.get('method')} method={_campo(metodo)} id={_campo(rid)} "
-                    f"name={_campo(nome)} traceparent={_campo(traceparent)} status={_campo(status['http'])}",
+                    f"mcp-request http_method={scope.get('method')} method={_campo(r.get('method'))} "
+                    f"id={_campo(r.get('id'))} name={_campo(r.get('name'))} pv={_campo(r.get('pv'))} "
+                    f"caps={_json_compacto(r.get('caps'))} traceparent={_campo(r.get('traceparent'))} "
+                    f"status={_campo(status['http'])}",
                     file=sys.stderr,
                     flush=True,
                 )

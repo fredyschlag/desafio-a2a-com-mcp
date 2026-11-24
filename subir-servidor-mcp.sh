@@ -6,4 +6,4 @@ cd "$(dirname "$0")"
 if [ -z "${REQUEST_STATE_SECRET:-}" ] && [ -f .env ]; then
   set -a; . ./.env; set +a
 fi
-exec uv run --project servidor-mcp python servidor-mcp/servidor.py
+exec uv run --locked --project servidor-mcp python servidor-mcp/servidor.py
